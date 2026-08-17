@@ -3,6 +3,7 @@
 import torch
 from omni_xpu_kernel import norm
 
+from comfy_kitchen.backends._modulation import adaln_prep_modulation
 from comfy_kitchen.backends.eager.adaln import adaln as eager_adaln
 from comfy_kitchen.backends.eager.adaln import rms_adaln as eager_rms_adaln
 
@@ -55,28 +56,26 @@ def rms_adaln(
 def _modulation_mapping(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
-    """Map common broadcast layouts to native flattened modulation rows."""
-    if scale.shape != shift.shape or scale.dtype != x.dtype or shift.dtype != x.dtype:
+    """Apply Kitchen's shared broadcast contract to the native row mapping."""
+    if scale.dtype != x.dtype or shift.dtype != x.dtype:
         return None
-    if scale.device != x.device or shift.device != x.device or scale.shape[-1] != x.shape[-1]:
+    if scale.device != x.device or shift.device != x.device:
         return None
-    if scale.dim() > x.dim():
+    if scale.shape != shift.shape or scale.dim() > x.dim() or scale.dim() == 0:
         return None
-    padded = (1,) * (x.dim() - scale.dim()) + tuple(scale.shape)
-    prefix = padded[:-1]
-    x_prefix = tuple(x.shape[:-1])
-    rows = x.numel() // x.shape[-1]
-    if all(dim == 1 for dim in prefix):
-        repeat = rows
-    elif prefix == x_prefix:
-        repeat = 1
-    elif prefix[-1] == 1 and prefix[:-1] == x_prefix[:-1]:
-        repeat = x_prefix[-1]
-    else:
+    rows, hidden = x.numel() // x.shape[-1], x.shape[-1]
+    try:
+        scale_2d, scale_repeat = adaln_prep_modulation(
+            scale, x, rows, hidden
+        )
+        shift_2d, shift_repeat = adaln_prep_modulation(
+            shift, x, rows, hidden
+        )
+    except RuntimeError:
         return None
-    return scale.reshape(-1, x.shape[-1]).contiguous(), shift.reshape(
-        -1, x.shape[-1]
-    ).contiguous(), repeat
+    if scale_repeat != shift_repeat:
+        return None
+    return scale_2d, shift_2d, scale_repeat
 
 
 __all__ = ["adaln", "rms_adaln"]

@@ -77,6 +77,26 @@ def test_xpu_rms_adaln_matches_reference():
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
 
 
+def test_xpu_rms_adaln_uses_shared_multidim_broadcast_mapping():
+    from comfy_kitchen.backends.xpu.adaln import _modulation_mapping
+
+    x = torch.randn(2, 1, 3, 4, 128, device="xpu", dtype=torch.bfloat16)
+    scale = torch.randn(2, 1, 1, 1, 128, device="xpu", dtype=torch.bfloat16)
+    shift = torch.randn_like(scale)
+
+    mapped = _modulation_mapping(x, scale, shift)
+    assert mapped is not None
+    scale_2d, shift_2d, row_repeat = mapped
+    assert scale_2d.shape == shift_2d.shape == (2, 128)
+    assert row_repeat == 12
+
+    with ck.use_backend("xpu"):
+        actual = ck.rms_adaln(x, scale, shift)
+    expected = torch.nn.functional.rms_norm(x.float(), (128,), eps=1e-6)
+    expected = (expected * (1 + scale.float()) + shift.float()).to(x.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+
+
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("layout", ["BHND", "BNHD"])
 def test_xpu_rope_arbitrary_matrix_pair_semantics(split_half, layout):

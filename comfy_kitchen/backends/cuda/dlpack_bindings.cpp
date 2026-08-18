@@ -18,6 +18,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <cuda_runtime.h>
+#include <climits>
 #include <cstring>
 #include <optional>
 
@@ -169,6 +170,34 @@ extern "C" {
         int64_t orig_cols,
         int input_dtype_code,
         cudaStream_t stream);
+
+    // SageAttention kernel launchers
+    void launch_quant_qk_per_thread_int8(
+        const void* q, void* q_int8, void* q_scale,
+        const void* k, void* k_int8, void* k_scale,
+        int B, int H_q, int Lq, int H_kv, int Lk, int C,
+        int BLKQ, int WARPQ, int BLKK, int WARPK,
+        int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+        int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+        int input_dtype_code, void* anchor_indices, cudaStream_t stream);
+
+    void launch_quant_v_int8_kernel(
+        const void* v, void* out, void* scale,
+        int B, int H, int N, int D, int padded_N,
+        int64_t sb, int64_t sh, int64_t sn,
+        int input_dtype_code, cudaStream_t stream);
+
+    void launch_sage_attn_kernel(
+        const void* q, const void* k, const void* v, void* o,
+        const void* q_scale, const void* k_scale, const void* v_scale,
+        const void* mask, int64_t mask_stride_b, int64_t mask_stride_h,
+        int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code,
+        int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D,
+        int q_st_bz, int q_st_n, int q_st_h,
+        int k_st_bz, int k_st_n, int k_st_h,
+        int v_st_bz, int v_st_h, int v_st_d,
+        int o_st_bz, int o_st_n, int o_st_h,
+        float sm_scale, int output_dtype_code, cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
@@ -807,6 +836,490 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+// Nanobind wrapper: signed INT8 V quantization
+void quant_v_int8(
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    nb::ndarray<nb::device::cuda> scale,
+    int padded_n,
+    int input_dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (v.ndim() != 4) {
+        throw std::runtime_error("quant_v_int8: v must be 4D [B,H,N,D]");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quant_v_int8_kernel(
+        v.data(), out.data(), scale.data(),
+        static_cast<int>(v.shape(0)),
+        static_cast<int>(v.shape(1)),
+        static_cast<int>(v.shape(2)),
+        static_cast<int>(v.shape(3)),
+        padded_n,
+        v.stride(0), v.stride(1), v.stride(2),
+        input_dtype_code, stream);
+}
+
+// Nanobind wrapper: stabilized INT8 Q/K per-thread quant (contiguous HND layout)
+void quant_qk_per_thread_int8(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> q_int8,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> k_int8,
+    nb::ndarray<nb::device::cuda> k_scale,
+    int BLKQ, int WARPQ, int BLKK, int WARPK,
+    int input_dtype_code,
+    uintptr_t stream_ptr,
+    uintptr_t anchor_indices_ptr)
+{
+    if (q.ndim() != 4 || k.ndim() != 4) {
+        throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quant_qk_per_thread_int8(
+        q.data(), q_int8.data(), q_scale.data(),
+        k.data(), k_int8.data(), k_scale.data(),
+        static_cast<int>(q.shape(0)),
+        static_cast<int>(q.shape(1)),
+        static_cast<int>(q.shape(2)),
+        static_cast<int>(k.shape(1)),
+        static_cast<int>(k.shape(2)),
+        static_cast<int>(q.shape(3)),
+        BLKQ, WARPQ, BLKK, WARPK,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        input_dtype_code,
+        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+}
+
+// Quantization half of the split INT8 SDPA API.  This deliberately launches
+// the same Q/K and V kernels with the same tiling as sage_sdpa below, so moving
+// the attention launch after the caller releases its input tensors does not
+// change any numerical results.
+void sage_sdpa_quantize(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> q_int8,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_int8,
+    nb::ndarray<nb::device::cuda> k_scale,
+    nb::ndarray<nb::device::cuda> v_int8,
+    nb::ndarray<nb::device::cuda> v_scale,
+    int cta_k,
+    int input_dtype_code,
+    uintptr_t stream_ptr,
+    uintptr_t anchor_indices_ptr)
+{
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+        throw std::runtime_error(
+            "sage_sdpa_quantize: q, k, and v must be 4D [B,H,L,D]");
+    }
+    if (cta_k != 64 && cta_k != 128) {
+        throw std::runtime_error("sage_sdpa_quantize: cta_k must be 64 or 128");
+    }
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error(
+            "sage_sdpa_quantize: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    }
+    if (!anchor_indices_ptr) {
+        throw std::runtime_error(
+            "sage_sdpa_quantize: anchor_indices scratch is required");
+    }
+
+    const int B = static_cast<int>(q.shape(0));
+    const int H_q = static_cast<int>(q.shape(1));
+    const int Lq = static_cast<int>(q.shape(2));
+    const int D = static_cast<int>(q.shape(3));
+    const int H_kv = static_cast<int>(k.shape(1));
+    const int Lk = static_cast<int>(k.shape(2));
+    const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
+
+    if (cta_k == 128 && D == 64) {
+        throw std::runtime_error(
+            "sage_sdpa_quantize: cta_k 128 is unsupported for head_dim 64");
+    }
+
+    if (k.shape(0) != B || v.shape(0) != B || v.shape(1) != H_kv ||
+        v.shape(2) != Lk || k.shape(3) != D || v.shape(3) != D) {
+        throw std::runtime_error("sage_sdpa_quantize: incompatible q, k, and v shapes");
+    }
+    if (q_int8.ndim() != 4 || k_int8.ndim() != 4 || v_int8.ndim() != 2 ||
+        q_int8.shape(0) != B || q_int8.shape(1) != H_q ||
+        q_int8.shape(2) != Lq || q_int8.shape(3) != D ||
+        k_int8.shape(0) != B || k_int8.shape(1) != H_kv ||
+        k_int8.shape(2) != Lk || k_int8.shape(3) != D ||
+        v_int8.shape(0) != static_cast<size_t>(B) * H_kv * D ||
+        v_int8.shape(1) != padded_Lk) {
+        throw std::runtime_error("sage_sdpa_quantize: incompatible INT8 output shapes");
+    }
+
+    constexpr int BLKQ = 128;
+    const int WARPQ = D == 256 ? 16 : 32;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+    launch_quant_qk_per_thread_int8(
+        q.data(), q_int8.data(), q_scale.data(),
+        k.data(), k_int8.data(), k_scale.data(),
+        B, H_q, Lq, H_kv, Lk, D,
+        BLKQ, WARPQ, cta_k, cta_k,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        input_dtype_code,
+        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+
+    launch_quant_v_int8_kernel(
+        v.data(), v_int8.data(), v_scale.data(),
+        B, H_kv, Lk, D, padded_Lk,
+        v.stride(0), v.stride(1), v.stride(2),
+        input_dtype_code, stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sage_sdpa_quantize kernel launch failed: ") +
+            cudaGetErrorString(err));
+    }
+}
+
+// Attention half of the split INT8 SDPA API.  The input tensors use the exact
+// packed layouts produced by sage_sdpa_quantize; no floating-point Q/K/V
+// tensor is retained or reconstructed.
+void sage_sdpa_prequantized(
+    nb::ndarray<nb::device::cuda> q_int8,
+    nb::ndarray<nb::device::cuda> k_int8,
+    nb::ndarray<nb::device::cuda> v_int8,
+    nb::ndarray<nb::device::cuda> o,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_scale,
+    nb::ndarray<nb::device::cuda> v_scale,
+    int cta_k,
+    float sm_scale,
+    int output_dtype_code,
+    uintptr_t stream_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt)
+{
+    if (q_int8.ndim() != 4 || k_int8.ndim() != 4 ||
+        v_int8.ndim() != 2 || o.ndim() != 4) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: q/k/o must be 4D and packed v must be 2D");
+    }
+    if (cta_k != 64 && cta_k != 128) {
+        throw std::runtime_error("sage_sdpa_prequantized: cta_k must be 64 or 128");
+    }
+    if (output_dtype_code != 1 && output_dtype_code != 2) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: output_dtype_code must be 1 (fp16) or 2 (bf16)");
+    }
+
+    const int B = static_cast<int>(q_int8.shape(0));
+    const int H_q = static_cast<int>(q_int8.shape(1));
+    const int Lq = static_cast<int>(q_int8.shape(2));
+    const int D = static_cast<int>(q_int8.shape(3));
+    const int H_kv = static_cast<int>(k_int8.shape(1));
+    const int Lk = static_cast<int>(k_int8.shape(2));
+    const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
+
+    if (cta_k == 128 && (D == 64 || attn_mask.has_value())) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: cta_k 128 requires unmasked head_dim 128 or 256");
+    }
+
+    if (k_int8.shape(0) != B || k_int8.shape(3) != D ||
+        o.shape(0) != B || o.shape(1) != H_q || o.shape(2) != Lq ||
+        o.shape(3) != D ||
+        v_int8.shape(0) != static_cast<size_t>(B) * H_kv * D ||
+        v_int8.shape(1) != padded_Lk) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: incompatible quantized tensor shapes");
+    }
+    if (q_int8.stride(3) != 1 || q_int8.stride(2) != D ||
+        q_int8.stride(1) != static_cast<int64_t>(Lq) * D ||
+        k_int8.stride(3) != 1 || k_int8.stride(2) != D ||
+        k_int8.stride(1) != static_cast<int64_t>(Lk) * D ||
+        v_int8.stride(1) != 1 || v_int8.stride(0) != padded_Lk ||
+        o.stride(3) != 1 || o.stride(2) != D ||
+        o.stride(1) != static_cast<int64_t>(Lq) * D) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: quantized tensors and output must be contiguous");
+    }
+
+    const void *mask_ptr = nullptr;
+    int64_t mask_stride_b = 0;
+    int64_t mask_stride_h = 0;
+    int64_t mask_stride_q = 0;
+    int64_t mask_stride_k = 0;
+    int mask_dtype_code = -1;
+    if (attn_mask.has_value()) {
+        const auto &mask = attn_mask.value();
+        if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H_q ||
+            mask.shape(2) != Lq || mask.shape(3) != Lk) {
+            throw std::runtime_error(
+                "sage_sdpa_prequantized: attention mask must be expanded to [B,H_q,Lq,Lk]");
+        }
+        if (mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool) {
+            mask_dtype_code = 3;
+        } else {
+            mask_dtype_code = map_dtype_to_code(mask.dtype());
+        }
+        if (mask_dtype_code < 0 || mask_dtype_code > 3) {
+            throw std::runtime_error(
+                "sage_sdpa_prequantized: attention mask must be bool, float16, bfloat16, or float32");
+        }
+        mask_ptr = mask.data();
+        mask_stride_b = mask.stride(0);
+        mask_stride_h = mask.stride(1);
+        mask_stride_q = mask.stride(2);
+        mask_stride_k = mask.stride(3);
+    }
+
+    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q) * Lq * D;
+    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
+    const int64_t v_st_bz64 = static_cast<int64_t>(H_kv) * D * padded_Lk;
+    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
+        throw std::overflow_error(
+            "sage_sdpa_prequantized: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
+    }
+
+    const int qi_st_h = Lq * D;
+    const int qi_st_n = D;
+    const int qi_st_bz = static_cast<int>(qi_st_bz64);
+    const int ki_st_h = Lk * D;
+    const int ki_st_n = D;
+    const int ki_st_bz = static_cast<int>(ki_st_bz64);
+    const int v_st_d = padded_Lk;
+    const int v_st_h = D * padded_Lk;
+    const int v_st_bz = static_cast<int>(v_st_bz64);
+    const int o_st_h = Lq * D;
+    const int o_st_n = D;
+    const int o_st_bz = static_cast<int>(qi_st_bz64);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_sage_attn_kernel(
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
+        q_scale.data(), k_scale.data(), v_scale.data(),
+        mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
+        mask_dtype_code, cta_k,
+        B, Lq, Lk, H_q, H_kv, D,
+        qi_st_bz, qi_st_n, qi_st_h,
+        ki_st_bz, ki_st_n, ki_st_h,
+        v_st_bz, v_st_h, v_st_d,
+        o_st_bz, o_st_n, o_st_h,
+        sm_scale, output_dtype_code, stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sage_sdpa_prequantized kernel launch failed: ") +
+            cudaGetErrorString(err));
+    }
+}
+
+// Nanobind wrapper: pure INT8 QK / U8-softmax / INT8-V attention kernel
+void sage_attn(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> o,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_scale,
+    nb::ndarray<nb::device::cuda> v_scale,
+    float sm_scale,
+    int output_dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
+        throw std::runtime_error("sage_attn: q, k, v, o must be 4D");
+    }
+
+    if (output_dtype_code != 1 && output_dtype_code != 2) {
+        throw std::runtime_error("sage_attn: output_dtype_code must be 1 (fp16) or 2 (bf16)");
+    }
+
+    constexpr int CTA_K = 64;
+    const int64_t padded_k_length =
+        ((static_cast<int64_t>(k.shape(2)) + CTA_K - 1) / CTA_K) * CTA_K;
+    if (v.shape(3) < padded_k_length || v.shape(3) % CTA_K != 0) {
+        throw std::runtime_error(
+            "sage_attn: packed V sequence extent must cover K and be a multiple of 64");
+    }
+
+    const int64_t st_q_bz = static_cast<int64_t>(q.stride(0));
+    const int64_t st_k_bz = static_cast<int64_t>(k.stride(0));
+    const int64_t st_v_bz = static_cast<int64_t>(v.stride(0));
+    const int64_t st_o_bz = static_cast<int64_t>(o.stride(0));
+    if (st_q_bz > INT_MAX || st_k_bz > INT_MAX ||
+        st_v_bz > INT_MAX || st_o_bz > INT_MAX) {
+        throw std::overflow_error(
+            "sage_attn: tensor strides exceed int32 range");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_sage_attn_kernel(
+        q.data(), k.data(), v.data(), o.data(),
+        q_scale.data(), k_scale.data(), v_scale.data(),
+        nullptr, 0, 0, 0, 0, -1,
+        CTA_K,
+        static_cast<int>(q.shape(0)),
+        static_cast<int>(q.shape(2)),
+        static_cast<int>(k.shape(2)),
+        static_cast<int>(q.shape(1)),
+        static_cast<int>(k.shape(1)),
+        static_cast<int>(q.shape(3)),
+        q.stride(0), q.stride(2), q.stride(1),
+        k.stride(0), k.stride(2), k.stride(1),
+        v.stride(0), v.stride(1), v.stride(2),
+        o.stride(0), o.stride(2), o.stride(1),
+        sm_scale, output_dtype_code, stream);
+}
+
+// Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
+// All scratch buffers are pre-allocated by the caller (Python frontend).
+void sage_sdpa(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> o,
+    nb::ndarray<nb::device::cuda> q_int8,
+    nb::ndarray<nb::device::cuda> q_scale,
+    nb::ndarray<nb::device::cuda> k_int8,
+    nb::ndarray<nb::device::cuda> k_scale,
+    nb::ndarray<nb::device::cuda> v_int8,
+    nb::ndarray<nb::device::cuda> v_scale,
+    float sm_scale,
+    int input_dtype_code,
+    int output_dtype_code,
+    uintptr_t stream_ptr,
+    uintptr_t anchor_indices_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt,
+    int cta_k = 0)
+{
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
+        throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
+    }
+
+    const int B = static_cast<int>(q.shape(0));
+    const int H_q = static_cast<int>(q.shape(1));
+    const int Lq = static_cast<int>(q.shape(2));
+    const int D = static_cast<int>(q.shape(3));
+    const int H_kv = static_cast<int>(k.shape(1));
+    const int Lk = static_cast<int>(k.shape(2));
+
+    const void *mask_ptr = nullptr;
+    int64_t mask_stride_b = 0;
+    int64_t mask_stride_h = 0;
+    int64_t mask_stride_q = 0;
+    int64_t mask_stride_k = 0;
+    int mask_dtype_code = -1;
+    if (attn_mask.has_value()) {
+        const auto &mask = attn_mask.value();
+        if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H_q ||
+            mask.shape(2) != Lq || mask.shape(3) != Lk) {
+            throw std::runtime_error(
+                "sage_sdpa: attention mask must be expanded to [B,H_q,Lq,Lk]");
+        }
+        if (mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool) {
+            mask_dtype_code = 3;
+        } else {
+            mask_dtype_code = map_dtype_to_code(mask.dtype());
+        }
+        if (mask_dtype_code < 0 || mask_dtype_code > 3) {
+            throw std::runtime_error(
+                "sage_sdpa: attention mask must be bool, float16, bfloat16, or float32");
+        }
+        mask_ptr = mask.data();
+        mask_stride_b = mask.stride(0);
+        mask_stride_h = mask.stride(1);
+        mask_stride_q = mask.stride(2);
+        mask_stride_k = mask.stride(3);
+    }
+
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("sage_sdpa: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    }
+    if (output_dtype_code != 1 && output_dtype_code != 2) {
+        throw std::runtime_error(
+            "sage_sdpa: output_dtype_code must be 1 (fp16) or 2 (bf16)");
+    }
+    if (cta_k == 0) {
+        cta_k = !attn_mask.has_value() && D >= 128 && Lk > 1024
+            ? 128
+            : 64;
+    }
+    if (cta_k != 64 && cta_k != 128) {
+        throw std::runtime_error("sage_sdpa: cta_k must be 64 or 128");
+    }
+    if (cta_k == 128 && (D == 64 || attn_mask.has_value())) {
+        throw std::runtime_error(
+            "sage_sdpa: cta_k 128 requires unmasked head_dim 128 or 256");
+    }
+    if (!anchor_indices_ptr) {
+        throw std::runtime_error(
+            "sage_sdpa: anchor_indices scratch is required");
+    }
+    constexpr int BLKQ = 128;
+    const int WARPQ = D == 256 ? 16 : 32;
+    const int BLKK = cta_k;
+    const int WARPK = cta_k;
+    const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+    launch_quant_qk_per_thread_int8(
+        q.data(), q_int8.data(), q_scale.data(),
+        k.data(), k_int8.data(), k_scale.data(),
+        B, H_q, Lq, H_kv, Lk, D,
+        BLKQ, WARPQ, BLKK, WARPK,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        input_dtype_code,
+        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+
+    launch_quant_v_int8_kernel(
+        v.data(), v_int8.data(), v_scale.data(),
+        B, H_kv, Lk, D, padded_Lk,
+        v.stride(0), v.stride(1), v.stride(2),
+        input_dtype_code, stream);
+
+    // int64_t arithmetic to detect overflow before narrowing to int.
+    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q)  * Lq * D;
+    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
+    const int64_t v_st_bz64  = static_cast<int64_t>(H_kv) * D * padded_Lk;
+
+    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
+        throw std::overflow_error(
+            "sage_sdpa: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
+    }
+
+    const int qi_st_h = Lq * D, qi_st_n = D, qi_st_bz = static_cast<int>(qi_st_bz64);
+    const int ki_st_h = Lk * D, ki_st_n = D, ki_st_bz = static_cast<int>(ki_st_bz64);
+    const int o_st_h  = Lq * D, o_st_n  = D, o_st_bz  = static_cast<int>(qi_st_bz64);
+    // v_int8 is [B*H_kv*D, padded_Lk] (2D from quant kernel).
+    // Attention expects V as [B, H, D, padded_N].
+    const int v_st_d  = padded_Lk;
+    const int v_st_h  = D * padded_Lk;
+    const int v_st_bz = static_cast<int>(v_st_bz64);
+
+    launch_sage_attn_kernel(
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
+        q_scale.data(), k_scale.data(), v_scale.data(),
+        mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
+        mask_dtype_code, cta_k,
+        B, Lq, Lk, H_q, H_kv, D,
+        qi_st_bz, qi_st_n, qi_st_h,
+        ki_st_bz, ki_st_n, ki_st_h,
+        v_st_bz, v_st_h, v_st_d,
+        o_st_bz, o_st_n, o_st_h,
+        sm_scale, output_dtype_code, stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("sage_sdpa kernel launch failed: ") + cudaGetErrorString(err));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SVDQuant W4A4 — nanobind/DLPack bindings for the native kitchen int4 kernels
 // (see ops/quantize_svdquant_w4a4.cu and ops/scaled_mm_svdquant_w4a4.cu).
@@ -1328,6 +1841,14 @@ extern "C" {
         int64_t scale_size,
         int group_size,
         int output_dtype_code,
+        cudaStream_t stream);
+
+    void launch_flash_decode(
+        const void* q, const void* k, const void* v, const int* kv_lengths,
+        void* output, float* softmax_lse, float* softmax_lse_accum, float* output_accum,
+        int batch, int query_length, int heads, int kv_capacity, int num_splits,
+        int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
+        int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
         cudaStream_t stream);
 
 }
@@ -2609,6 +3130,50 @@ void dequantize_int8_convrot_weight(
         stream);
 }
 
+void flash_attention_decode(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> q,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> k,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> v,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> kv_lengths,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> output,
+    nb::ndarray<float, nb::device::cuda> softmax_lse,
+    nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
+    nb::ndarray<float, nb::device::cuda> output_accum,
+    int num_splits,
+    uintptr_t stream_ptr) {
+    const int batch = k.shape(0);
+    const int kv_capacity = k.shape(1);
+    const int heads = k.shape(2);
+    const int query_length = q.shape(0) / batch;
+    if (batch <= 0 || kv_capacity <= 0 || heads <= 0 || query_length <= 0 || q.shape(0) != batch * query_length || q.shape(1) != heads || q.shape(2) != 128) {
+        throw std::runtime_error("Invalid Flash Attention decode dimensions");
+    }
+    if (v.shape(0) != batch || v.shape(1) != kv_capacity || v.shape(2) != heads || v.shape(3) != 128 || k.shape(3) != 128) {
+        throw std::runtime_error("Flash Attention k/v shape mismatch");
+    }
+    if (output.shape(0) != q.shape(0) || output.shape(1) != heads || output.shape(2) != 128 || kv_lengths.size() != static_cast<size_t>(batch)) {
+        throw std::runtime_error("Flash Attention output or length shape mismatch");
+    }
+    if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2 || map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("Flash Attention tensors must have bfloat16 dtype");
+    }
+    const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 || (num_splits > 1 && (softmax_lse_accum.size() != lse_size * num_splits || output_accum.size() != lse_size * 128 * num_splits))) {
+        throw std::runtime_error("Invalid Flash Attention split workspace");
+    }
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
+        throw std::runtime_error("Unsupported Flash Attention tensor strides");
+    }
+
+    launch_flash_decode(
+        q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
+        num_splits > 1 ? softmax_lse_accum.data() : nullptr,
+        num_splits > 1 ? output_accum.data() : nullptr,
+        batch, query_length, heads, kv_capacity, num_splits,
+        q.stride(0) * query_length, q.stride(0), q.stride(1),
+        k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
     
@@ -2996,6 +3561,95 @@ NB_MODULE(_C, m) {
           nb::arg("pad_32x") = false,
           nb::arg("stream_ptr"));
 
+    m.def("_quant_v_int8", &quant_v_int8,
+          "Quantize V [B,H,N,D] to signed INT8 rows [B*H*D,padded_N] with per-row scale",
+          nb::arg("v"),
+          nb::arg("out"),
+          nb::arg("scale"),
+          nb::arg("padded_n"),
+          nb::arg("input_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("_quant_qk_per_thread_int8", &quant_qk_per_thread_int8,
+          "INT8 per-thread quant for Q and K (HND), same tiling as Triton quant_per_thread",
+          nb::arg("q"),
+          nb::arg("q_int8"),
+          nb::arg("q_scale"),
+          nb::arg("k"),
+          nb::arg("k_int8"),
+          nb::arg("k_scale"),
+          nb::arg("blk_q"),
+          nb::arg("warp_q"),
+          nb::arg("blk_k"),
+          nb::arg("warp_k"),
+          nb::arg("input_dtype_code"),
+          nb::arg("stream_ptr"),
+          nb::arg("anchor_indices_ptr"));
+
+    m.def("_sage_attn", &sage_attn,
+          "Pure INT8 QK / U8-softmax / INT8-V attention kernel",
+          nb::arg("q"),
+          nb::arg("k"),
+          nb::arg("v"),
+          nb::arg("o"),
+          nb::arg("q_scale"),
+          nb::arg("k_scale"),
+          nb::arg("v_scale"),
+          nb::arg("sm_scale"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("sage_sdpa_quantize", &sage_sdpa_quantize,
+          "Prequantize Q/K/V for split pure-INT8 SDPA",
+          nb::arg("q"),
+          nb::arg("k"),
+          nb::arg("v"),
+          nb::arg("q_int8"),
+          nb::arg("q_scale"),
+          nb::arg("k_int8"),
+          nb::arg("k_scale"),
+          nb::arg("v_int8"),
+          nb::arg("v_scale"),
+          nb::arg("cta_k"),
+          nb::arg("input_dtype_code"),
+          nb::arg("stream_ptr"),
+          nb::arg("anchor_indices_ptr"));
+
+    m.def("sage_sdpa_prequantized", &sage_sdpa_prequantized,
+          "Run pure-INT8 SDPA from prequantized Q/K/V",
+          nb::arg("q_int8"),
+          nb::arg("k_int8"),
+          nb::arg("v_int8"),
+          nb::arg("o"),
+          nb::arg("q_scale"),
+          nb::arg("k_scale"),
+          nb::arg("v_scale"),
+          nb::arg("cta_k"),
+          nb::arg("sm_scale"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"),
+          nb::arg("attn_mask") = nb::none());
+
+    m.def("sage_sdpa", &sage_sdpa,
+          "Fused pure-INT8 SDPA: quant_qk + quant_v + attention in one call",
+          nb::arg("q"),
+          nb::arg("k"),
+          nb::arg("v"),
+          nb::arg("o"),
+          nb::arg("q_int8"),
+          nb::arg("q_scale"),
+          nb::arg("k_int8"),
+          nb::arg("k_scale"),
+          nb::arg("v_int8"),
+          nb::arg("v_scale"),
+          nb::arg("sm_scale"),
+          nb::arg("input_dtype_code"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"),
+          nb::arg("anchor_indices_ptr"),
+          nb::arg("attn_mask") = nb::none(),
+          nb::arg("cta_k") = 0);
+
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "
           "act_unsigned selects scale=max/15 + clamp [0,15] for u4 MMA downstream; "
@@ -3045,6 +3699,12 @@ NB_MODULE(_C, m) {
           nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("flash_attention_decode", &flash_attention_decode,
+          "Flash Attention decode over a fixed-capacity variable-length KV cache",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
+          nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
+          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",

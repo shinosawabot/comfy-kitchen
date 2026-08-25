@@ -222,6 +222,34 @@ assert 'cuda' not in ck.list_backends()
         )
         assert result.returncode == 0, result.stderr
 
+    def test_clean_import_without_packaged_cuda_backend(self):
+        script = """
+import importlib.abc
+import sys
+
+class BlockCudaBackend(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == 'comfy_kitchen.backends.cuda':
+            error = ModuleNotFoundError(f'No module named {fullname!r}')
+            error.name = fullname
+            raise error
+        return None
+
+sys.meta_path.insert(0, BlockCudaBackend())
+import comfy_kitchen as ck
+assert ck.flash_attention_decode_is_available() is False
+assert ck.int8_attention_is_available() is False
+assert ck.registry._priority == ['xpu', 'triton', 'eager']
+assert 'cuda' not in ck.list_backends()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
     def test_xpu_constraints_are_device_specific(self):
         from comfy_kitchen.backends.xpu import _build_constraints
 

@@ -1,5 +1,27 @@
 # Comfy Kitchen XPU
 
+> [!IMPORTANT]
+> **Experimental Intel XPU fork — limited validation scope**
+>
+> The XPU changes in this fork are developed and performance-tuned for work
+> related to [Intel llm-scaler](https://github.com/intel/llm-scaler), primarily
+> on Ubuntu 24.04 LTS with Intel Arc Pro B70.
+>
+> Other operating systems, GPU models, software environments, workloads, and
+> configurations are outside the validated scope. Their compatibility,
+> correctness, output quality, stability, and performance are not guaranteed.
+>
+> If you have a specific requirement outside the current scope, you may open a
+> relevant issue with the complete environment, expected use case, and a
+> reproducible example. Opening an issue provides a way to document and discuss
+> the request. Whether it can be explored or supported will depend on its
+> relevance, reproducibility, and available capacity. The validated scope will
+> be updated only after any additional support has been implemented and
+> validated.
+>
+> This is a personal downstream fork, not an upstream release or an official
+> commitment to support the upstream project on Intel XPU.
+
 Intel XPU integration for
 [Comfy-Org/comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen), backed
 by the optional

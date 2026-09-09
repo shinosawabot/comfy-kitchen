@@ -238,25 +238,42 @@ def sol_attn_chunked(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
 ):
-    """Upstream chunked-producer API; no XPU implementation is available yet."""
-    raise NotImplementedError("sol_attn_chunked is not yet supported on XPU")
+    """Sol attention over BF16 QKV projection chunks with bounded RMS/RoPE.
+
+    Returns attention output, next K mean and next V scale. A callable producer
+    is replayed twice on bootstrap and once when previous statistics are given.
+    """
+    device = getattr(rope_freqs, "device", None)
+    if not sol_attn_is_available(device):
+        raise NotImplementedError("sol_attn_chunked requires the complete native XPU Sol sidecar")
+    return _xpu_backend.sol_attn_chunked(
+        qkv_chunks, t, h, rope_freqs, qk_norm_weights, kmean, vscale,
+        tau=tau, topk_ratio=topk_ratio, scale=scale,
+        sink_blocks=sink_blocks, sink_q=sink_q, rope_eps=rope_eps,
+        tail=tail, block_len=block_len, coarse_gate=coarse_gate,
+        token_aug=token_aug,
+    )
 
 
 def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
-    """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
-    backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
-    per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
-    if _cuda_backend is None or not torch.cuda.is_available():
+    """Whether the native Sol sidecar is available on the requested XPU.
+
+    Per-call BF16/FP16, matching BTHD tensors and head-dimension 128 rules apply.
+    """
+    try:
+        if device is None or isinstance(device, int):
+            device = torch.device("xpu", device)
+        else:
+            device = torch.device(device)
+        if device.type != "xpu" or not torch.xpu.is_available():
+            return False
+        index = torch.xpu.current_device() if device.index is None else device.index
+        return (0 <= index < torch.xpu.device_count()
+                and registry.is_available("xpu")
+                and _xpu_backend._SOL_AVAILABLE
+                and registry.get_constraints("xpu", "sol_attn") is not None)
+    except (TypeError, ValueError, RuntimeError):
         return False
-    if getattr(torch.version, "hip", None):
-        # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
-        # only on WMMA parts, so its registration is the answer
-        return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
-    rules = registry.get_constraints("cuda", "sol_attn")
-    ext = getattr(_cuda_backend, "_C", None)
-    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
-            and rules is not None
-            and torch.cuda.get_device_capability(device) >= rules.min_compute_capability)
 
 
 def na3d(

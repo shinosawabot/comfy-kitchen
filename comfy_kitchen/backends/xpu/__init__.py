@@ -6,10 +6,14 @@ import sys
 
 import torch
 
-from comfy_kitchen.constraints import ExactDims, FunctionConstraints, ParamConstraint
+from comfy_kitchen.constraints import (
+    ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
+)
 from comfy_kitchen.registry import registry
 
 __all__ = [
+    "sol_attn",
+    "sol_attn_chunked",
     "adaln",
     "rms_adaln",
     "apply_rope",
@@ -65,6 +69,8 @@ _ROPE_AVAILABLE = False
 _RMS_ROPE_AVAILABLE = False
 _CONVROT_NATIVE_AVAILABLE = False
 _GGUF_AVAILABLE = False
+_SOL_AVAILABLE = False
+_SOL_ERROR = None
 
 _REQUIRED_NATIVE_INT8_OPS = frozenset(
     {
@@ -173,7 +179,22 @@ except (ImportError, OSError, RuntimeError) as exc:
     _ERROR = f"{type(exc).__name__}: {exc}"
 
 
+# The optional CUTE sidecar is independent of the core extension. An older
+# sidecar must not disable the other Kitchen XPU capabilities.
 if _AVAILABLE:
+    try:
+        from omni_xpu_kernel.cute import sol_attn_v2 as _sol
+        _SOL_AVAILABLE = _sol.is_available()
+        if not _SOL_AVAILABLE:
+            _SOL_ERROR = "the Sol sidecar does not expose the complete native API"
+    except (ImportError, OSError, RuntimeError) as exc:
+        _SOL_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+if _AVAILABLE:
+    if _SOL_AVAILABLE:
+        sol_attn = _sol.sol_attn
+        sol_attn_chunked = _sol.sol_attn_chunked
     if _INT8_AVAILABLE:
         quantize_int8_tensorwise = _int8.quantize_int8_tensorwise
         quantize_int8_rowwise = _int8.quantize_int8_rowwise
@@ -702,6 +723,15 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                     default_devices=xpu,
                 ),
             }
+        )
+    if _SOL_AVAILABLE:
+        capabilities["sol_attn"] = FunctionConstraints(
+            params={name: ParamConstraint(
+                dtypes=frozenset({torch.bfloat16, torch.float16}),
+                shape_rules=(ExactDims(4),),
+            ) for name in ("q", "k", "v")},
+            default_devices=xpu,
+            call_rules=(sol_attn_common_call_rule,),
         )
     return capabilities
 

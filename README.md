@@ -46,8 +46,8 @@ the upstream maintainers and contributors for the library architecture,
 operator APIs, QuantizedTensor design, backend registry, eager/CUDA/Triton
 implementations, packaging, and tests on which this work is built.
 
-The XPU development line is based on upstream Comfy Kitchen `0.2.31` at
-[`7c6ca3a`](https://github.com/Comfy-Org/comfy-kitchen/commit/7c6ca3a5b63857d42c2d49777d6afb69de23f13f).
+The XPU development line is based on upstream Comfy Kitchen `0.2.33` at
+[`e9ea99c`](https://github.com/Comfy-Org/comfy-kitchen/commit/e9ea99cf2f0af1d0c49c04690d4153a91c2b8668).
 The Intel-specific work in this fork is intentionally optional: importing
 Comfy Kitchen remains safe when PyTorch XPU, `omni_xpu_kernel`, its native
 extension, or Intel GPU hardware is absent.
@@ -244,6 +244,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |
+| `sol_attn`                  | ✓     | ✓    |        | ✓   |
 | `int8_attention`            |       | ✓    |        | ✓   |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
@@ -463,7 +464,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 ### Requirements
 
 - **Python**: ≥3.10
-- **PyTorch**: ≥2.5.0
+- **PyTorch**: ≥2.7.0
 - **CUDA Runtime** (for CUDA wheels): ≥13.0
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable

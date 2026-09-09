@@ -67,16 +67,24 @@ def hip():
     return hip_backend
 
 
-# Covers each tile path: GEMV (M <= 8), 64x64, 128x128 and 256x128 (K > N), plus
-# sizes that are not multiples of the macro tile.
+# Covers each tile path on 16-48 WGP parts: GEMV (M <= 8), skinny (M or N <= 64),
+# and 64x64/128x128 at both K depths including both deep-K warp grids. K=2064/4112
+# are multiples of 16 but not of BKB=128, to hit its K tail.
 GEMM_SHAPES = [
     (1, 256, 256),
     (8, 512, 256),
     (17, 256, 512),
+    (64, 512, 2064),
     (128, 512, 256),
+    (256, 48, 512),
+    (300, 300, 2064),
     (333, 1152, 1152),
     (512, 256, 1024),
+    (512, 512, 4112),
+    (1024, 512, 4112),
+    (1024, 1024, 4112),
     (1024, 2048, 512),
+    (2048, 2048, 4112),
 ]
 
 
@@ -131,6 +139,27 @@ def test_int8_linear_matches_eager(m, n, k, per_channel):
 def test_int8_linear_convrot_matches_eager():
     torch.manual_seed(0)
     m, n, k = 256, 512, 512
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@needs_wmma
+@pytest.mark.parametrize("k", [3840, 10240, 32768])
+def test_int8_linear_convrot_large_k_matches_eager(k):
+    """G=256 INT8 convrot: fused (3840, 10240), global spill (32768) vs eager."""
+    torch.manual_seed(k)
+    m, n = 64, 256
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
     w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
     wq, ws = ck.quantize_int8_rowwise(w)
@@ -359,20 +388,23 @@ def test_convrot_quantizer_folds_the_activation_in(hip):
     assert fused_s.shape == (x.shape[0],)
 
 
+@pytest.mark.parametrize("group_size", [16, 256])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_convrot_int8_preserves_input_dtype_precision(hip, dtype):
-    """The fused row buffer must not introduce a BF16-only rounding stage."""
-    group = 16
-    x = torch.zeros(2, 64, device=DEV, dtype=dtype)
+def test_convrot_int8_preserves_input_dtype_precision(hip, dtype, group_size):
+    """The fused row buffer must round to the input dtype before absmax, like legacy."""
+    k = group_size if group_size == 256 else group_size * 4
+    idx1 = group_size if group_size == 16 else group_size // 4
+    norm = (1.0 / float(group_size)) ** 0.5
+    x = torch.zeros(2, k, device=DEV, dtype=dtype)
     x[0, 0] = 1.001
-    x[1, 16] = 3.141
-    h = _build_hadamard(group, device=DEV, dtype=dtype)
+    x[1, idx1] = 3.141
+    h = _build_hadamard(group_size, device=DEV, dtype=dtype)
 
-    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group)
-    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group)
+    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group_size)
+    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group_size)
 
-    values = torch.stack((x[0, 0], x[1, 16]))
-    expected_rowmax = (values.float() * 0.25).to(dtype).float().abs()
+    values = torch.stack((x[0, 0], x[1, idx1]))
+    expected_rowmax = (values.float() * norm).to(dtype).float().abs()
     torch.testing.assert_close(scales_hip.reshape(-1) * 127.0, expected_rowmax, rtol=1e-6, atol=0)
     torch.testing.assert_close(scales_hip, scales_eager, rtol=1e-6, atol=0)
     assert (q_hip.int() - q_eager.int()).abs().max().item() <= 1
@@ -1097,8 +1129,11 @@ def test_rms_adaln_is_not_adaln(hip):
 
 
 @pytest.mark.parametrize("split_half", [False, True])
-@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_rope_matches_eager(split_half, freqs_dtype):
+    """The kernel rotates in fp32 and rounds like eager, which evaluates in the
+    freqs dtype, so a narrow freqs dtype has to come out bit-identical. Loose
+    tolerances hid a folded round_fp16 that left the fp16 path a rounding short."""
     torch.manual_seed(0)
     batch, heads, seq, dim = 2, 8, 128, 64
     xq = torch.randn(batch, heads, seq, dim, device=DEV, dtype=torch.bfloat16)
@@ -1111,8 +1146,14 @@ def test_rope_matches_eager(split_half, freqs_dtype):
     with ck.use_backend("eager"):
         qr, kr = pair(xq, xk, freqs)
 
-    torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    if freqs_dtype is torch.float32:
+        # -ffast-math contracts the split-half add into an fma, one rounding fewer
+        # than eager's separate products; immaterial at fp32 width
+        torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    else:
+        assert torch.equal(q, qr)
+        assert torch.equal(k, kr)
 
 
 # (in-place name, functional sibling, takes a q/k pair, takes a norm weight)
@@ -1707,6 +1748,24 @@ def test_stochastic_rounding_fp8_edge_values_match_eager(dtype):
     assert torch.isnan(q.float()[~finite]).all()
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("numel", [15, 16, 17, 1 << 20])
+def test_stochastic_rounding_fp8_vector_and_scalar_paths_agree(hip, dtype, numel, out_dtype):
+    """An offset view runs the scalar fallback, which must give the same bits as
+    the vectorized path. The sizes straddle kVecElems to cover the chunk tail, and
+    the two fp8 formats take different constants through the rounding."""
+    torch.manual_seed(numel)
+    x = torch.randn(numel, device=DEV, dtype=dtype) * 10
+    rng = torch.randint(0, 256, (numel,), dtype=torch.uint8, device=DEV)
+
+    aligned = hip.stochastic_rounding_fp8(x.clone(), rng.clone(), out_dtype)
+    offset = hip.stochastic_rounding_fp8(_offset_copy(x), _offset_copy(rng), out_dtype)
+
+    assert x.data_ptr() % 16 == 0 and rng.data_ptr() % 16 == 0
+    assert torch.equal(aligned.view(torch.uint8), offset.view(torch.uint8))
+
+
 # A zero-length dimension makes the grid zero-dimensional, which HIP rejects with
 # hipErrorInvalidConfiguration rather than treating as a no-op.
 @needs_wmma
@@ -2116,8 +2175,39 @@ def test_convrot_falls_back_to_eager_past_the_lds_bound(hip, dtype):
     sb = torch.zeros(2, dtype=torch.float32, device=DEV)
     with pytest.raises(RuntimeError, match="LDS"):
         hip._C.quantize_int8_convrot(
-            hip._dl(x), hip._dl(qb), hip._dl(sb), 2, k, 64, 0, hip._stream(x)
+            hip._dl(x), hip._dl(qb), hip._dl(sb), None, None, 2, k, 64, 0, hip._stream(x)
         )
+
+
+def test_convrot_spill_rotated_dtype_must_match_x(hip):
+    """spill_rotated is written as RowT derived from x; dtype must match."""
+    m, k = 2, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
+    q = torch.zeros(m, k, dtype=torch.int8, device=DEV)
+    scales = torch.zeros(m, dtype=torch.float32, device=DEV)
+    spill_rotated = torch.empty(m, k, dtype=torch.bfloat16, device=DEV)
+    spill_partials = torch.empty(m, k // 256, dtype=torch.float32, device=DEV)
+    with pytest.raises(RuntimeError, match="spill_rotated dtype must match x"):
+        hip._C.quantize_int8_convrot(
+            hip._dl(x),
+            hip._dl(q),
+            hip._dl(scales),
+            hip._dl(spill_rotated),
+            hip._dl(spill_partials),
+            m,
+            k,
+            256,
+            0,
+            hip._stream(x),
+        )
+
+
+@needs_wmma
+def test_convrot_int8_needs_spill_probe(hip):
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
+    with torch.cuda.device(DEV):
+        assert not hip._C.convrot_int8_needs_spill(4128, 10240, in_code)
+        assert hip._C.convrot_int8_needs_spill(4128, 32768, in_code)
 
 
 def test_convrot_lds_bound_accounts_for_row_dtype(hip):

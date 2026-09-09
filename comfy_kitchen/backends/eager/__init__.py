@@ -1,6 +1,7 @@
 __all__ = [
     "adaln",
     "na3d",
+    "sol_attn",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -60,6 +61,7 @@ from comfy_kitchen.constraints import (
     FunctionConstraints,
     ParamConstraint,
     na3d_common_call_rule,
+    sol_attn_common_call_rule,
 )
 from comfy_kitchen.registry import registry
 
@@ -114,6 +116,7 @@ from .rope import (
     rms_rope_split_half1_,
     rms_rope_split_half_,
 )
+from .sol_attn import sol_attn
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 from .svdquant_w4a16 import svdquant_w4a16_linear
 from .w4a8_int8 import (
@@ -643,6 +646,15 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    out["sol_attn"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+            "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+            "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+        },
+        default_devices=all_devices,
+        call_rules=(sol_attn_common_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),

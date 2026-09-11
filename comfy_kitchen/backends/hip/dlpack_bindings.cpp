@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -48,8 +49,8 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
                                      const void*, int, int, int, int, int, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
-void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, int, int, int, int,
-                                         hipStream_t);
+void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
+                                         int, int, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -59,6 +60,7 @@ void launch_dequantize_int8_convrot_weight_kernel(const void*, const void*, void
 void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, int, hipStream_t);
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
+int convrot_int8_needs_spill_host(int, int, int);
 
 void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
                                          int64_t, int, bool, uint64_t, hipStream_t);
@@ -401,7 +403,8 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 }
 
 // act_code folds an elementwise activation into the rotation's load.
-void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
+void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
+                           OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
@@ -415,8 +418,25 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
+    void* spill_rotated_ptr = nullptr;
+    void* spill_partials_ptr = nullptr;
+    if (spill_rotated.has_value()) {
+        require_dtype(*spill_rotated, 0, 2, kFn, "spill_rotated");
+        require_len(*spill_rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
+        if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
+        }
+        spill_rotated_ptr = spill_rotated->data();
+    }
+    if (spill_partials.has_value()) {
+        require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
+        require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        spill_partials_ptr = spill_partials->data();
+    }
+
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
-                                        scales.data(), M, K, group_size, act_code,
+                                        scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
+                                        group_size, act_code,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -1346,8 +1366,410 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                 reinterpret_cast<hipStream_t>(stream_ptr), kFn);
 }
 
+
+// BF16 decode attention. Every extent below is derived from the operands rather
+// than taken from the caller, and the kernel indexes with the strides passed
+// here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
+// the CUDA binding and adds the two the HIP kernel needs: it reads four
+// elements at a time, and it addresses the output with q's strides.
+void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
+                            nb::ndarray<> kv_lengths, nb::ndarray<> output,
+                            nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
+                            nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode";
+    constexpr int kHeadDim = 128;
+    constexpr int kElemsPerLoad = 4;
+    if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
+        kv_lengths.ndim() != 1) {
+        throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
+    }
+    const int batch = static_cast<int>(k.shape(0));
+    const int kv_capacity = static_cast<int>(k.shape(1));
+    const int heads = static_cast<int>(k.shape(2));
+    require_positive(batch, kFn, "batch");
+    require_positive(kv_capacity, kFn, "kv_capacity");
+    require_positive(heads, kFn, "heads");
+    const int query_length = static_cast<int>(q.shape(0)) / batch;
+    require_positive(query_length, kFn, "query_length");
+    if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
+        static_cast<int>(q.shape(1)) != heads || static_cast<int>(q.shape(2)) != kHeadDim ||
+        static_cast<int>(k.shape(3)) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
+    }
+    if (static_cast<int>(v.shape(0)) != batch || static_cast<int>(v.shape(1)) != kv_capacity ||
+        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
+    }
+    if (output.shape(0) != q.shape(0) || static_cast<int>(output.shape(1)) != heads ||
+        static_cast<int>(output.shape(2)) != kHeadDim ||
+        kv_lengths.size() != static_cast<size_t>(batch)) {
+        throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(output, 2, 2, kFn, "output");
+    if (map_dtype_to_code(kv_lengths.dtype()) != -1 ||
+        kv_lengths.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        kv_lengths.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": kv_lengths must be int32");
+    }
+
+    const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
+        (num_splits > 1 &&
+         (softmax_lse_accum.size() != lse_size * num_splits ||
+          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+        throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
+    }
+    require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
+    // The lengths and the split workspace are indexed linearly off their base
+    // pointers, so a strided view of the right size is read as though packed.
+    require_packed_contiguous(kv_lengths, kFn, "kv_lengths");
+    require_packed_contiguous(softmax_lse, kFn, "softmax_lse");
+    if (num_splits > 1) {
+        require_dtype(softmax_lse_accum, 0, 0, kFn, "softmax_lse_accum");
+        require_dtype(output_accum, 0, 0, kFn, "output_accum");
+        require_packed_contiguous(softmax_lse_accum, kFn, "softmax_lse_accum");
+        require_packed_contiguous(output_accum, kFn, "output_accum");
+    }
+
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) ||
+        k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
+        throw std::runtime_error(std::string(kFn) + ": unsupported tensor strides");
+    }
+    // The kernel writes the output off q's strides, the way the CUDA launcher
+    // does. Here that is checked rather than assumed.
+    if (output.stride(0) != q.stride(0) || output.stride(1) != q.stride(1)) {
+        throw std::runtime_error(std::string(kFn) + ": output strides must match q");
+    }
+    // Rows are read four elements at a time, so every row start has to stay on
+    // that boundary.
+    const int64_t vectored[] = {q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2)};
+    for (int64_t stride : vectored) {
+        if (stride % kElemsPerLoad != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        }
+    }
+    // A view carries a byte offset, so operands with aligned strides can still
+    // begin off the boundary the four-element load needs.
+    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
+    for (const void* base : row_starts) {
+        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        }
+    }
+    // The launcher takes raw pointers, so anything but ROCm device memory would
+    // be dereferenced on the device as though it were. The CUDA binding gets
+    // this from its nb::device::cuda operand types; this one takes plain
+    // ndarrays and has to ask. Testing for "not kDLCPU" is not enough: pinned
+    // host memory reports kDLCUDAHost and is still a host pointer.
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q,      &k,          &v,
+                                       &output, &kv_lengths, &softmax_lse};
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    if (num_splits > 1 &&
+        (softmax_lse_accum.device_type() != kDeviceRocm ||
+         output_accum.device_type() != kDeviceRocm ||
+         softmax_lse_accum.device_id() != q.device_id() ||
+         output_accum.device_id() != q.device_id())) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": split workspace must be ROCm device memory on q's device");
+    }
+
+    launch_flash_decode(
+        q.data(), k.data(), v.data(), static_cast<const int*>(kv_lengths.data()), output.data(),
+        static_cast<float*>(softmax_lse.data()),
+        num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
+        num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr, batch,
+        query_length, heads, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
+        q.stride(1), k.stride(0), k.stride(1), k.stride(2),
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+
+// ---------------------------------------------------------------------------
+// Sol-Attn sparse attention
+// ---------------------------------------------------------------------------
+//
+// _C is importable, so none of this can assume the Python layer put it together.
+// The kernels reach q/k/v and the workspace as bare pointers sized from (B, T, H),
+// so a short buffer, or a layout the 16-byte staging loads cannot use, is an
+// out-of-bounds device access rather than an exception.
+
+// The kernels read these as packed arrays of one dtype, so an element count on
+// its own is not enough: a narrower dtype makes the buffer shorter in bytes than
+// the kernel reads, and a strided view of the right count is accessed as though
+// it were packed. `code` is a DTYPE_TO_CODE value.
+static void sol_need_elems(const nb::ndarray<>& a, int64_t n, int code, const char* fn,
+                           const char* what) {
+    if (static_cast<int64_t>(a.size()) != n) {
+        throw std::runtime_error(std::string(fn) + ": " + what + " must have " +
+                                 std::to_string(n) + " elements, got " + std::to_string(a.size()));
+    }
+    if (map_dtype_to_code(a.dtype()) != code) {
+        throw std::runtime_error(std::string(fn) + ": " + what + " has an unsupported dtype");
+    }
+    int64_t expect = 1;
+    for (int i = static_cast<int>(a.ndim()) - 1; i >= 0; --i) {
+        if (a.shape(i) > 1 && a.stride(i) != expect) {
+            throw std::runtime_error(std::string(fn) + ": " + what + " must be contiguous");
+        }
+        expect *= static_cast<int64_t>(a.shape(i));
+    }
+}
+
+// Extents size every workspace slot and every grid, and they reach the kernels as
+// plain ints. A non-positive one plans a workspace nothing checks again.
+static void sol_need_extents(int64_t batch, int64_t seq_len, int64_t num_heads, const char* fn) {
+    if (batch <= 0 || seq_len <= 0 || num_heads <= 0) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": batch, seq_len and num_heads must all be positive");
+    }
+}
+
+// Both sinks are half-open [start, end) block ranges, mirroring
+// sol_attn_common_call_rule on the Python side. A negative start would make the
+// routing kernel emit that many extra list entries, wrapped to huge uint16 block
+// ids, and overrun the per-query row.
+static void sol_need_sinks(int64_t start, int64_t end, const char* fn, const char* what) {
+    if (start < 0 || end < 0 || end < start) {
+        throw std::runtime_error(std::string(fn) + ": " + what +
+                                 " must be a [start, end) range with 0 <= start <= end");
+    }
+}
+
+static void sol_check_block_len(const nb::ndarray<>& b, int64_t seq_len, const char* fn) {
+    if (b.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        b.dtype().bits != 32 || b.ndim() != 1 || b.stride(0) != 1 ||
+        static_cast<int64_t>(b.size()) != (seq_len + 63) / 64) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": block_len must be a contiguous 1-D int32 array of "
+                                 "ceil(T/64) elements");
+    }
+}
+
+static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t seq_len,
+                               int64_t num_heads, int64_t token_aug, const char* fn) {
+    int64_t v[48];
+    const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+    if (n > 48 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
+        throw std::runtime_error(std::string(fn) + ": workspace too small for this shape");
+    }
+    // sol_attn_plan reports byte offsets and the Python layer slices the workspace
+    // with them to read the block means back out, so a workspace of anything but
+    // bytes reads the wrong slots. The size check above already bounds the
+    // allocation, since no element is narrower than a byte; this pins the units.
+    if (map_dtype_to_code(ws.dtype()) != 3) {
+        throw std::runtime_error(std::string(fn) + ": workspace must be a uint8 array");
+    }
+}
+
+// q/k/v/out element code for launch_sol_attn: 0 = bfloat16, 1 = float16, -1 = neither
+static int sol_elem_code(const nb::ndarray<>& a) {
+    const int code = map_dtype_to_code(a.dtype());
+    return code == 2 ? 0 : code == 1 ? 1 : -1;
+}
+static void sol_need_bthd(const nb::ndarray<>& a, int64_t b, int64_t t, int64_t h, int64_t d,
+                          int elem, const char* fn, const char* what) {
+    if (a.ndim() != 4 || sol_elem_code(a) != elem ||
+        a.shape(0) != static_cast<size_t>(b) || a.shape(1) != static_cast<size_t>(t) ||
+        a.shape(2) != static_cast<size_t>(h) || a.shape(3) != static_cast<size_t>(d)) {
+        throw std::runtime_error(std::string(fn) + ": " + what +
+                                 " must be a (B, T, H, D) array of q's dtype (bfloat16 or float16)");
+    }
+}
+
+// The kernels stage rows with 16-byte loads: unit last stride, 16-byte base, and
+// leading strides (of non-singleton dims) that keep every row 16-byte aligned.
+static void sol_need_staging_layout(const nb::ndarray<>& a, const char* fn, const char* what) {
+    bool ok = a.stride(3) == 1 && reinterpret_cast<uintptr_t>(a.data()) % 16 == 0;
+    for (int i = 0; i < 3; ++i) ok = ok && (a.shape(i) <= 1 || a.stride(i) % 8 == 0);
+    if (!ok) {
+        throw std::runtime_error(
+            std::string(fn) + ": " + what +
+            " must have a contiguous last dim, a 16-byte aligned base and leading strides that "
+            "are multiples of 8");
+    }
+}
+
+static void sol_need_contiguous(const nb::ndarray<>& a, const char* fn, const char* what) {
+    int64_t expect = 1;
+    for (int i = static_cast<int>(a.ndim()) - 1; i >= 0; --i) {
+        if (a.shape(i) > 1 && a.stride(i) != expect) {
+            throw std::runtime_error(std::string(fn) + ": " + what + " must be contiguous");
+        }
+        expect *= static_cast<int64_t>(a.shape(i));
+    }
+}
+
+// Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
+nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads,
+                          int64_t token_aug = 0) {
+    int64_t v[48];
+    const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+    if (n > 48) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
+    nb::dict d;
+    for (int i = 0; i < n && sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
+    return d;
+}
+
+void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> out,
+              nb::ndarray<> workspace, int64_t batch, int64_t seq_len, int64_t num_heads,
+              int64_t head_dim, float tau, float scale, int64_t sink_start, int64_t sink_end,
+              int64_t sink_q_start, int64_t sink_q_end, uintptr_t stream_ptr,
+              OptArray key_bias = std::nullopt, OptArray threshold = std::nullopt,
+              OptArray block_len = std::nullopt, bool tail = true, int64_t token_aug = 0) {
+    constexpr const char* kFn = "sol_attn";
+    auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
+    sol_need_extents(batch, seq_len, num_heads, kFn);
+    sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
+    sol_need_sinks(sink_q_start, sink_q_end, kFn, "sink_q");
+    if (threshold) {
+        sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
+    }
+    if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
+    const int elem = sol_elem_code(q);
+    if (elem < 0) throw std::runtime_error(std::string(kFn) + ": q must be bfloat16 or float16");
+    sol_need_bthd(q, batch, seq_len, num_heads, head_dim, elem, kFn, "q");
+    sol_need_bthd(k, batch, seq_len, num_heads, head_dim, elem, kFn, "k");
+    sol_need_bthd(v, batch, seq_len, num_heads, head_dim, elem, kFn, "v");
+    sol_need_bthd(out, batch, seq_len, num_heads, head_dim, elem, kFn, "out");
+    sol_need_staging_layout(q, kFn, "q");
+    sol_need_staging_layout(k, kFn, "k");
+    sol_need_staging_layout(v, kFn, "v");
+    sol_need_contiguous(out, kFn, "out");
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
+    if (key_bias) sol_need_elems(*key_bias, batch * seq_len, 0, kFn, "key_bias");
+    // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
+    launch_sol_attn(q.data(), k.data(), v.data(), out.data(), workspace.data(),
+                    static_cast<int>(batch), static_cast<int>(seq_len),
+                    static_cast<int>(num_heads), static_cast<int>(head_dim), elem, tau, scale,
+                    opt_data(key_bias), opt_data(threshold), opt_data(block_len), tail ? 1 : 0,
+                    static_cast<int>(sink_start), static_cast<int>(sink_end),
+                    static_cast<int>(sink_q_start), static_cast<int>(sink_q_end), q.stride(0),
+                    q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+                    v.stride(1), v.stride(2), static_cast<int>(token_aug), stream);
+    check_hip_launch();
+}
+
+void sol_producer_begin_py(nb::ndarray<> workspace, int64_t batch, int64_t seq_len,
+                           int64_t num_heads, uintptr_t stream_ptr, int64_t token_aug = 0) {
+    sol_need_extents(batch, seq_len, num_heads, "sol_producer_begin");
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_begin");
+    sol_producer_begin(workspace.data(), static_cast<int>(batch), static_cast<int>(seq_len),
+                       static_cast<int>(num_heads), static_cast<int>(token_aug),
+                       reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarray<> fab,
+                           nb::ndarray<> qw, nb::ndarray<> kw, nb::ndarray<> kmean,
+                           nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
+                           int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
+                           uintptr_t stream_ptr, OptArray block_len = std::nullopt,
+                           int64_t token_aug = 0) {
+    constexpr const char* kFn = "sol_producer_chunk";
+    sol_need_extents(batch, seq_len, num_heads, kFn);
+    if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
+    if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": rot_dim must be a multiple of 8 in (0, 128]");
+    }
+    if (t0 < 0 || m < 0 || t0 + m > seq_len || (m && t0 % 64)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
+    }
+    if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
+    sol_need_elems(qkv, m * 3 * num_heads * 128, 2, kFn, "qkv");
+    sol_need_elems(fab, seq_len * rot_dim * 2, 0, kFn, "fab");
+    sol_need_elems(qw, 128, 2, kFn, "qw");
+    sol_need_elems(kw, 128, 2, kFn, "kw");
+    sol_need_elems(kmean, batch * num_heads * 128, 0, kFn, "kmean");
+    sol_need_elems(vscale, batch * num_heads * 128, 0, kFn, "vscale");
+    sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(), kw.data(),
+                       kmean.data(), vscale.data(), opt_data(block_len), rope_eps,
+                       static_cast<int>(rot_dim), static_cast<int>(t0), static_cast<int>(m),
+                       static_cast<int>(batch), static_cast<int>(seq_len),
+                       static_cast<int>(num_heads), static_cast<int>(token_aug),
+                       reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> vscale,
+                      nb::ndarray<> kmean_next, nb::ndarray<> vamax_out, int64_t batch,
+                      int64_t seq_len, int64_t num_heads, float tau, float scale,
+                      int64_t sink_start, int64_t sink_end, int64_t sink_q_start,
+                      int64_t sink_q_end, uintptr_t stream_ptr, OptArray threshold = std::nullopt,
+                      OptArray block_len = std::nullopt, bool tail = true,
+                      int64_t token_aug = 0) {
+    constexpr const char* kFn = "sol_attn_core";
+    sol_need_extents(batch, seq_len, num_heads, kFn);
+    sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
+    sol_need_sinks(sink_q_start, sink_q_end, kFn, "sink_q");
+    const int64_t stats = batch * num_heads * 128;
+    sol_need_elems(vscale, stats, 0, kFn, "vscale");
+    sol_need_elems(kmean_next, stats, 0, kFn, "kmean_next");
+    sol_need_elems(vamax_out, stats, 0, kFn, "vamax_out");
+    if (threshold) {
+        sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
+    }
+    if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
+    sol_need_elems(out, batch * seq_len * num_heads * 128, 2, kFn, "out");
+    launch_sol_attn_core(workspace.data(), out.data(), vscale.data(), kmean_next.data(),
+                         vamax_out.data(), opt_data(block_len), tail ? 1 : 0,
+                         static_cast<int>(batch), static_cast<int>(seq_len),
+                         static_cast<int>(num_heads), tau, scale, opt_data(threshold),
+                         static_cast<int>(sink_start), static_cast<int>(sink_end),
+                         static_cast<int>(sink_q_start), static_cast<int>(sink_q_end),
+                         static_cast<int>(token_aug),
+                         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
+    m.def("sol_attn_plan", &sol_attn_plan_py,
+          "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("token_aug") = 0);
+    m.def("sol_attn", &sol_attn,
+          "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"), nb::arg("workspace"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("head_dim"),
+          nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
+          nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
+          nb::arg("key_bias") = nb::none(), nb::arg("threshold") = nb::none(),
+          nb::arg("block_len") = nb::none(), nb::arg("tail") = true,
+          nb::arg("token_aug") = 0);
+    m.def("sol_producer_begin", &sol_producer_begin_py,
+          nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("stream_ptr"), nb::arg("token_aug") = 0);
+    m.def("sol_producer_chunk", &sol_producer_chunk_py,
+          nb::arg("workspace"), nb::arg("qkv"), nb::arg("fab"), nb::arg("qw"), nb::arg("kw"),
+          nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
+          nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
+          nb::arg("token_aug") = 0);
+    m.def("sol_attn_core", &sol_attn_core_py,
+          nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
+          nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
+          nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
+          nb::arg("threshold") = nb::none(), nb::arg("block_len") = nb::none(),
+          nb::arg("tail") = true, nb::arg("token_aug") = 0);
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
     m.def("dequantize_per_tensor_fp8", &dequantize_per_tensor_fp8);
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
@@ -1361,12 +1783,18 @@ NB_MODULE(_C, m) {
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
+    m.def("convrot_int8_needs_spill", &convrot_int8_needs_spill_host, nb::arg("m"),
+          nb::arg("k"), nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
     m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("na3d", &na3d);
+    m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
+          nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
+          nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
+          nb::arg("stream_ptr"));
     m.def("sage_sdpa", &sage_sdpa, nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
           nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("sm_scale"),

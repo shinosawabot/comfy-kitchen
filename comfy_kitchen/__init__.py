@@ -2,6 +2,9 @@ import torch
 
 from ._version import __version__
 
+# CUDA is retained as upstream source, but excluded from XPU wheels.
+_cuda_backend = None
+
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
@@ -75,6 +78,9 @@ __all__ = [
     "flash_attention_decode_is_available",
     "na2d",
     "na3d",
+    "sol_attn",
+    "sol_attn_chunked",
+    "sol_attn_is_available",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -144,6 +150,130 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def sol_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tau: float = 1.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
+    tail: bool = True,
+    block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
+) -> torch.Tensor:
+    """Sol-Attn training-free sparse attention (arXiv 2607.24027).
+
+    Each 64-token query block attends a routed subset of key blocks exactly and
+    covers the rest with one pooled term per block, so the full sequence still
+    contributes to the softmax denominator. The win grows with sequence length;
+    below roughly 12k tokens dense or a fused attention is usually faster.
+
+    Args:
+        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The fused
+            backends take bfloat16 or float16; head_dim is fixed at 128.
+        tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
+            blocks exactly: cheaper and less accurate.
+        scale: Score scale; None means ``head_dim ** -0.5``.
+        sink_blocks: ``[start, end)`` key blocks always attended exactly by every
+            query -- conditioning rows, typically.
+        sink_q: ``[start, end)`` query blocks that attend everything exactly.
+        key_bias: Per-key additive logit bias in natural log, ``(T,)``,
+            ``(B, T)`` or an SDPA-style ``(B|1, 1, 1, T)`` float or bool mask.
+            Honoured by the exact branch only, so biased blocks must be
+            covered by ``sink_blocks``.
+        topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
+            keep this fraction of key blocks per query block (the selection the
+            lightx2v SLA LoRAs were distilled against). tau is ignored then.
+        tail: False drops the pooled term so the softmax runs over the routed
+            blocks only (VSA / SLA fine stage).
+        block_len: int32 ``(ceil(T/64),)`` live tokens at the front of each
+            64-token block, for zero-padded tiles. Values are clamped to
+            ``[1, rows in the block]``; dead rows are never keys and their
+            output rows are unspecified.
+        coarse_gate: ``(B, T, H, 128)`` per-token gate for VSA's coarse branch:
+            ``gate * softmax(q_mean k_mean^T * scale) v_mean`` is added per block.
+        token_aug: 0, or a multiple of 64 up to 256: up to that many tokens per
+            query block are routed individually, the highest-scoring ones outside
+            the routed blocks, and attended exactly. The eager reference ignores
+            it.
+
+    Returns:
+        ``(B, T, H, 128)`` attention output.
+    """
+    return torch.ops.comfy_kitchen.sol_attn(
+        q, k, v, tau, scale,
+        [0, 0] if sink_blocks is None else list(sink_blocks),
+        [0, 0] if sink_q is None else list(sink_q),
+        key_bias,
+        float(topk_ratio),
+        bool(tail),
+        block_len,
+        coarse_gate,
+        int(token_aug),
+    )
+
+
+def sol_attn_chunked(
+    qkv_chunks,
+    t: int,
+    h: int,
+    rope_freqs: torch.Tensor,
+    qk_norm_weights: tuple[torch.Tensor, torch.Tensor],
+    kmean: torch.Tensor | None = None,
+    vscale: torch.Tensor | None = None,
+    tau: float = 1.0,
+    topk_ratio: float = 0.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    rope_eps: float = 1e-6,
+    tail: bool = True,
+    block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
+):
+    """Sol attention over BF16 QKV projection chunks with bounded RMS/RoPE.
+
+    Returns attention output, next K mean and next V scale. A callable producer
+    is replayed twice on bootstrap and once when previous statistics are given.
+    """
+    device = getattr(rope_freqs, "device", None)
+    if not sol_attn_is_available(device):
+        raise NotImplementedError("sol_attn_chunked requires the complete native XPU Sol sidecar")
+    return _xpu_backend.sol_attn_chunked(
+        qkv_chunks, t, h, rope_freqs, qk_norm_weights, kmean, vscale,
+        tau=tau, topk_ratio=topk_ratio, scale=scale,
+        sink_blocks=sink_blocks, sink_q=sink_q, rope_eps=rope_eps,
+        tail=tail, block_len=block_len, coarse_gate=coarse_gate,
+        token_aug=token_aug,
+    )
+
+
+def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
+    """Whether the native Sol sidecar is available on the requested XPU.
+
+    Per-call BF16/FP16, matching BTHD tensors and head-dimension 128 rules apply.
+    """
+    try:
+        if device is None or isinstance(device, int):
+            device = torch.device("xpu", device)
+        else:
+            device = torch.device(device)
+        if device.type != "xpu" or not torch.xpu.is_available():
+            return False
+        index = torch.xpu.current_device() if device.index is None else device.index
+        return (0 <= index < torch.xpu.device_count()
+                and registry.is_available("xpu")
+                and _xpu_backend._SOL_AVAILABLE
+                and registry.get_constraints("xpu", "sol_attn") is not None)
+    except (TypeError, ValueError, RuntimeError):
+        return False
 
 
 def na3d(

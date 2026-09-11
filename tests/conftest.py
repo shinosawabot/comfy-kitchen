@@ -10,6 +10,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "cuda: mark test as requiring CUDA")
     config.addinivalue_line("markers", "xpu: mark test as requiring Intel XPU")
     config.addinivalue_line("markers", "slow: mark test as slow running")
+    config.addinivalue_line("markers", "performance: mark test as a GPU timing benchmark")
     config.addinivalue_line("markers", "cupy: mark test as requiring CuPy")
 
 
@@ -20,6 +21,29 @@ def pytest_sessionfinish(session, exitstatus):
     if sys.platform == "win32" and torch is not None:
         if torch.cuda.is_available() and getattr(torch.version, "hip", None):
             torch.cuda.synchronize()
+
+
+@pytest.fixture(autouse=True)
+def restore_backend_selection():
+    """Put the registry's priority order and disabled set back after every test.
+
+    Both are process-global, so a test that changes one and does not restore it
+    re-routes every later test in the session. The failure is silent, and worst on
+    ROCm: the default order is ["hip", "cuda", "triton", "eager"], so a list
+    written without "hip" leaves the HIP backend registered but unreachable, and
+    later dispatch assertions get triton or eager instead of failing on the
+    backend that actually changed it.
+    """
+    from comfy_kitchen.registry import registry
+
+    priority = list(registry._priority)
+    disabled = set(registry._disabled)
+    yield
+    registry.set_priority(priority)
+    for name in set(registry._disabled) - disabled:
+        registry.enable(name)
+    for name in disabled - set(registry._disabled):
+        registry.disable(name)
 
 
 def cuda_backend_available() -> bool:
@@ -91,7 +115,7 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
     capable = []
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "xpu", "triton", "eager"]:
+    for backend_name in ["cuda", "hip", "xpu", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 
@@ -113,7 +137,7 @@ def get_supported_devices(func_name: str) -> set[str]:
     devices = set()
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "xpu", "triton", "eager"]:
+    for backend_name in ["cuda", "hip", "xpu", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 

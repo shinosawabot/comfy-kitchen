@@ -84,7 +84,7 @@ class TestParamConstraint:
         assert constraint.check_dtype(torch.float16) is False
 
     def test_device_passes(self, device):
-        default_devices = frozenset({"cuda", "cpu"})
+        default_devices = frozenset({"cuda", "cpu", "xpu"})
         constraint = ParamConstraint(devices=None)  # Inherit default
         tensor = torch.randn(10, device=device)
         assert constraint.check_device(tensor, default_devices) is True
@@ -142,7 +142,7 @@ class TestFunctionConstraints:
                 "x": ParamConstraint(dtypes=frozenset({torch.float32})),
                 "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
             },
-            default_devices=frozenset({"cuda", "cpu"}),
+            default_devices=frozenset({"cuda", "cpu", "xpu"}),
         )
         kwargs = {
             "x": torch.randn(10, dtype=torch.float32, device=device),
@@ -227,7 +227,7 @@ class TestRegistryConstraintValidation:
         }
         backend = ck.registry.get_capable_backend("quantize_per_tensor_fp8", kwargs)
         assert backend is not None
-        assert backend in ["cuda", "triton", "eager"]
+        assert backend in ["hip", "cuda", "xpu", "triton", "eager"]
 
     def test_get_capable_backend_no_match(self, device):
         """Test NoCapableBackendError when no backend can handle the call."""

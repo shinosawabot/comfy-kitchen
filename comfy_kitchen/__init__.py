@@ -965,6 +965,10 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -976,11 +980,15 @@ def int8_linear(
         out_dtype: Output dtype.
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
-        input_act: Optional elementwise activation applied to x before
-            quantization ("gelu_tanh", or None). When the fused ConvRot
-            quantizer handles the shape it is folded in, so an MLP's
-            ``linear(act(proj(x)))`` never writes act's output to HBM; every
-            other path applies it eagerly for identical results.
+        input_act: Optional activation applied to x before quantization
+            ("gelu_tanh", "swiglu", "rms_norm", or None). When the fused
+            ConvRot quantizer handles the shape it is folded in, so an MLP's
+            ``linear(act(proj(x)))`` or ``linear(rms_norm(x))`` never writes
+            the intermediate to HBM; every other path applies it eagerly.
+        input_act_weight: K-element norm weight, required for "rms_norm".
+        input_act_eps: Norm epsilon for "rms_norm".
+        residual: Optional tensor for ``residual + residual_scale * linear(x)``.
+        residual_scale: Per-channel scale for the residual form.
 
     Returns:
         Result tensor.
@@ -996,6 +1004,10 @@ def int8_linear(
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
         "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

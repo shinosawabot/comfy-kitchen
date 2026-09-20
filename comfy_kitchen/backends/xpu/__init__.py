@@ -9,6 +9,7 @@ import torch
 from comfy_kitchen.constraints import (
     ExactDims, FunctionConstraints, ParamConstraint, sol_attn_common_call_rule,
 )
+from comfy_kitchen.backends._activations import apply_input_act, apply_residual
 from comfy_kitchen.registry import registry
 
 __all__ = [
@@ -261,9 +262,25 @@ if _AVAILABLE:
             convrot: bool = False,
             convrot_groupsize: int = 256,
             input_act: str | None = None,
+            input_act_weight: torch.Tensor | None = None,
+            input_act_eps: float = 0.0,
+            residual: torch.Tensor | None = None,
+            residual_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            if not torch.compiler.is_compiling():
-                return _int8.int8_linear(
+            original_input_act = input_act
+            if input_act == "rms_norm":
+                x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
+                input_act = None
+
+            if (
+                not torch.compiler.is_compiling()
+                or original_input_act == "rms_norm"
+                or input_act_weight is not None
+                or input_act_eps != 0.0
+                or residual is not None
+                or residual_scale is not None
+            ):
+                out = _int8.int8_linear(
                     x,
                     weight,
                     weight_scale,
@@ -273,6 +290,7 @@ if _AVAILABLE:
                     convrot_groupsize,
                     input_act,
                 )
+                return apply_residual(out, residual, residual_scale)
 
             actual_dtype = x.dtype if out_dtype is None else out_dtype
             output_dtype_code = {
@@ -423,6 +441,9 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
+                "input_act_weight": ParamConstraint(dtypes=floats),
+                "residual": ParamConstraint(dtypes=floats),
+                "residual_scale": ParamConstraint(dtypes=floats),
             },
             default_devices=xpu,
         ),

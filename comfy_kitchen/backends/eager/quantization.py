@@ -9,6 +9,7 @@
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
+from comfy_kitchen.backends._activations import apply_residual as _apply_residual
 from comfy_kitchen.float_utils import (
     E8M0_BIAS,
     F4_E2M1_MAX,
@@ -977,6 +978,10 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
@@ -995,7 +1000,7 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
-    x = _apply_input_act(x, input_act)
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
@@ -1053,7 +1058,8 @@ def int8_linear(
     if bias is not None:
         result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
 
-    return result.reshape(*orig_shape[:-1], weight.shape[0])
+    result = result.reshape(*orig_shape[:-1], weight.shape[0])
+    return _apply_residual(result, residual, residual_scale)
 
 
 # =============================================================================
@@ -1212,6 +1218,10 @@ def _op_int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
@@ -1223,6 +1233,10 @@ def _op_int8_linear(
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
         "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)
@@ -1230,6 +1244,8 @@ def _op_int8_linear(
 
 @_op_int8_linear.register_fake
 def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code,
-                         convrot=False, convrot_groupsize=256, input_act=None):
+                         convrot=False, convrot_groupsize=256, input_act=None,
+                         input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)

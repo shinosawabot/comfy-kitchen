@@ -254,6 +254,9 @@ def _build_constraints() -> dict:
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
+                "input_act_weight": ParamConstraint(dtypes=standard_floats),
+                "residual": ParamConstraint(dtypes=standard_floats),
+                "residual_scale": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot

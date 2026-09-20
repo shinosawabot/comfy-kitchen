@@ -90,7 +90,7 @@ def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
         assert manifest["canonical_import"] == "comfy_kitchen"
         assert manifest["canonical_distribution"] == {
             "name": "comfy-kitchen",
-            "compatible_versions": ["0.2.33"],
+            "compatible_versions": ["0.2.33", "0.2.35"],
         }
         assert manifest["source"]["revision"] == "a" * 40
         assert manifest["source"]["wheel_sha256"] == hashlib.sha256(

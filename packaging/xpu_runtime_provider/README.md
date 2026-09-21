@@ -23,9 +23,7 @@ python packaging/xpu_runtime_provider/build_wheel.py \
 companion build. This option only records runtime activation eligibility; the
 provider does not compile kernels or establish support for additional operators. Existing operator capability checks and
 input constraints still apply. DG2 admission requires a compatible DG2
-companion build and matching Torch XPU runtime. The target metadata does not
-declare support for additional operators; SVDQuant follows the capabilities
-exposed by the matching `omni_xpu_kernel` build.
+companion build and matching Torch XPU runtime.
 
 The output wheel contains a lightweight entry point in
 `comfyui_omnixpu.runtime_providers` plus a manifest recording the canonical

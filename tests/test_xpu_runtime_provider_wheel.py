@@ -55,7 +55,7 @@ def _source_wheel(path: Path, *, distribution: str = "comfy-kitchen") -> Path:
     return path
 
 
-@pytest.mark.parametrize("xpu_target", ["bmg", "ptl-h", "dg2"])
+@pytest.mark.parametrize("xpu_target", ["bmg", "ptl-h", "dg2", "lnl"])
 def test_provider_wheel_has_disjoint_top_level_and_verified_manifest(
     tmp_path, monkeypatch, xpu_target
 ):
@@ -179,7 +179,7 @@ def test_provider_builder_rejects_unknown_target(tmp_path, target):
         )
 
 
-@pytest.mark.parametrize("target", ["bmg", "ptl-h", "dg2"])
+@pytest.mark.parametrize("target", ["bmg", "ptl-h", "dg2", "lnl"])
 def test_cli_accepts_supported_target(tmp_path, monkeypatch, target):
     builder = _load_builder()
     monkeypatch.setattr(sys, "argv", [

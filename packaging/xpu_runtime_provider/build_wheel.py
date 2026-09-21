@@ -26,7 +26,7 @@ PROVIDER_ID = "comfy_kitchen.xpu"
 ENTRY_POINT_GROUP = "comfyui_omnixpu.runtime_providers"
 SOURCE_REPOSITORY = "https://github.com/shinosawabot/comfy-kitchen.git"
 SUPPORTED_PLATFORMS = ("linux", "win32")
-SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h", "dg2")
+SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h", "dg2", "lnl")
 FORWARD_COMPATIBLE_VERSIONS = {
     "0.2.33": ("0.2.33", "0.2.35"),
 }

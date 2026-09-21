@@ -145,8 +145,8 @@ The XPU integration uses the pure-Python Kitchen wheel; native Intel code stays
 in `omni_xpu_kernel`.
 
 ```bash
-git clone https://github.com/xiangyuT/comfy-kitchen-xpu.git
-cd comfy-kitchen-xpu
+git clone https://github.com/shinosawabot/comfy-kitchen.git
+cd comfy-kitchen
 python -m pip install build
 python -m build --wheel
 pip install --force-reinstall --no-deps dist/comfy_kitchen-0.2.31-py3-none-any.whl

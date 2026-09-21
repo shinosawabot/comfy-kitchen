@@ -9,7 +9,7 @@ upstream Comfy Kitchen, but the CUDA backend and native CUDA artifacts are not
 included in this wheel.
 
 See the
-[Comfy Kitchen XPU repository](https://github.com/xiangyuT/comfy-kitchen-xpu)
+[Comfy Kitchen XPU repository](https://github.com/shinosawabot/comfy-kitchen)
 for installation and companion-wheel build instructions. This work is based on
 and remains grateful to
 [Comfy-Org/comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen).

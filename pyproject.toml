@@ -20,7 +20,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/xiangyuT/comfy-kitchen-xpu"
+Homepage = "https://github.com/shinosawabot/comfy-kitchen"
 Upstream = "https://github.com/Comfy-Org/comfy-kitchen"
 
 [project.optional-dependencies]

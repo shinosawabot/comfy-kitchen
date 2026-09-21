@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from omni_xpu_kernel import svdq
+from omni_xpu_kernel import svdq, __xpu_target__
 
 from comfy_kitchen.backends.eager import svdquant as eager_svdquant
 
@@ -92,11 +92,17 @@ def scaled_mm_svdquant_w4a4(
 
     dequantize = svdq.dequantize_u4 if act_unsigned else svdq.dequantize_w4
     act_fp = dequantize(act.view(torch.uint8), ascales, compute_dtype)
-    out = svdq.onednn_int4_gemm(
-        act_fp,
-        wgt.view(torch.uint8),
-        wscales,
-    )
+    if __xpu_target__ == "lnl":
+        # The oneDNN f16/u4 route does not reproduce Kitchen's BF16 weight
+        # rounding. Keep Omni dequantization and the reference matmul contract.
+        weight_fp = svdq.dequantize_w4(wgt.view(torch.uint8), wscales, compute_dtype)
+        out = act_fp @ weight_fp.t()
+    else:
+        out = svdq.onednn_int4_gemm(
+            act_fp,
+            wgt.view(torch.uint8),
+            wscales,
+        )
     lora = lora_act_in.float() @ lora_up.float().t()
     out = out + lora.to(out.dtype)
     if bias is not None:
@@ -116,11 +122,18 @@ def scaled_mm_svdquant_w4a4_preconverted(
 ) -> torch.Tensor:
     """Run SVDQuant with destructively prepared, single-copy XPU weights."""
     act_fp = svdq.dequantize_w4(act.view(torch.uint8), ascales, compute_dtype)
-    out = svdq.onednn_int4_gemm_preconverted(
-        act_fp,
-        packed_u4.view(torch.uint8),
-        scales_f16,
-    )
+    if __xpu_target__ == "lnl":
+        packed_s4 = packed_u4.view(torch.uint8).bitwise_xor(0x88)
+        weight_fp = svdq.dequantize_w4(
+            packed_s4, scales_f16.to(compute_dtype), compute_dtype
+        )
+        out = act_fp @ weight_fp.t()
+    else:
+        out = svdq.onednn_int4_gemm_preconverted(
+            act_fp,
+            packed_u4.view(torch.uint8),
+            scales_f16,
+        )
     lora = lora_act_in.float() @ lora_up.float().t()
     out = out + lora.to(out.dtype)
     if bias is not None:

@@ -18,12 +18,14 @@ python packaging/xpu_runtime_provider/build_wheel.py \
   --xpu-target bmg
 ```
 
-`--xpu-target` accepts `bmg`, `ptl-h`, or `dg2`. Use the target matching the
-installed `omni_xpu_kernel` companion build. This option only records runtime
-activation eligibility; the provider does not compile kernels or establish
-support for additional operators. Existing operator capability checks and
+`--xpu-target` accepts `bmg`, `ptl-h`, `dg2`, or the experimental Windows
+`lnl` target. Use the target matching the installed `omni_xpu_kernel`
+companion build. This option only records runtime activation eligibility; the
+provider does not compile kernels or establish support for additional operators. Existing operator capability checks and
 input constraints still apply. DG2 admission requires a compatible DG2
-companion build and matching Torch XPU runtime.
+companion build and matching Torch XPU runtime. LNL SVDQuant uses the reference
+dequantization/matmul fallback when the native oneDNN int4 route is
+not available.
 
 The output wheel contains a lightweight entry point in
 `comfyui_omnixpu.runtime_providers` plus a manifest recording the canonical
